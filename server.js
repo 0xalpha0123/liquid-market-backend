@@ -55,17 +55,83 @@ app.listen(process.env.PORT || 5000);
 
 setInterval(async () => {}, 5000);
 
+// const cycle = async () => {
+//   console.log("cycling...");
+//   const collection = await getXCollection();
+//   if (collection && collection[0]) {
+//     const counter = parseInt(collection[0].counter);
+//     console.log("new counter = ", counter);
+//     replaceInXCollection(collection[0], { counter: counter + 1 });
+//   }
+//   setTimeout(() => {
+//     cycle();
+//   }, 5000);
+// };
+
+// const cycle = async () => {
+//   console.log("cycling...");
+//   const funds = [];
+//   const numFunds = await xStore.methods.vaultsLength().call();
+//   for (let i = 0; i < numFunds; i++) {
+//     const fund = { vaultId: i };
+//     fund.xTokenAddress = await xStore.methods.xTokenAddress(i).call();
+//     fund.isD2Vault = await xStore.methods.isD2Vault(i).call();
+//     if (fund.isD2Vault) {
+//       fund.d2AssetAddress = await.xStore.methods.d2AssetAddress(i).call();
+//     } else {
+//       fund.nftAddress = await xStore.methods.
+//     }
+//   }
+//   setTimeout(() => {
+//     cycle();
+//   }, 5000);
+// };
+
 const cycle = async () => {
-  console.log("cycling...");
-  const collection = await getXCollection();
-  if (collection && collection[0]) {
-    const counter = parseInt(collection[0].counter);
-    console.log("new counter = ", counter);
-    replaceInXCollection(collection[0], { counter: counter + 1 });
+  console.log("\ncycling...");
+  const initialBlock = 11442000;
+  const currentBlock = await web3.eth.getBlockNumber();
+  let startBlock = initialBlock;
+  let interval = 10240;
+  const events = [];
+  while (startBlock < currentBlock) {
+    console.log("\ninside first while loop");
+    if (interval < 10240) {
+      interval *= 2;
+      console.log("doubling interval to", interval);
+    }
+    let _events;
+    while (!_events) {
+      const endBlock = startBlock + interval;
+      console.log("\ninside second while loop");
+      try {
+        _events = await xStore.getPastEvents("allEvents", {
+          fromBlock: startBlock,
+          toBlock: endBlock,
+        });
+        console.log("got _events, length = ", _events.length);
+      } catch (error) {
+        throw error;
+        if (interval <= 1) {
+          throw "bottomed out inside cycle()";
+        } else {
+          console.log(error.message);
+          interval /= 2;
+          console.log("dividing interval in half to", interval);
+        }
+      }
+    }
+    console.log("outside second while loop");
+    events = events.concat(_events);
+    startBlock = endBlock + 1;
   }
+  console.log("outside first while loop");
+
   setTimeout(() => {
     cycle();
   }, 5000);
 };
 
-cycle();
+setTimeout(() => {
+  cycle();
+}, 5000);
