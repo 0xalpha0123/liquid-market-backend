@@ -27,6 +27,17 @@ export const addToCollection = async (collectionName, obj) => {
   }
 };
 
+export const deleteFromCollection = async (collectionName, objToDelete) => {
+  try {
+    return await client
+      .db("xdb")
+      .collection(collectionName)
+      .deleteOne({ _id: ObjectId(objToDelete._id) });
+  } catch (err) {
+    throw new Error(err);
+  }
+};
+
 export const updateInCollection = async (
   collectionName,
   objToUpdate,

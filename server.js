@@ -13,11 +13,13 @@ import addresses from "./addresses/mainnet.json";
 
 import xcollection from "./routes/xcollection";
 import {
-  addToCollection,
   getCollection,
+  addToCollection,
+  deleteFromCollection,
   updateInCollection,
   replaceInCollection,
 } from "./db";
+import e from "express";
 
 const app = express();
 
@@ -61,96 +63,88 @@ app.use("/xcollection", xcollection);
 app.listen(process.env.PORT || 5000);
 
 //
-let loopIndex = 0;
-const cycle = async () => {
-  console.log("\ncycling...", loopIndex);
 
+setTimeout(async () => {
+  // await dbClient.db("xdb").collection("xstore_event_chunks").deleteMany({});
+  // await dbClient.db("xdb").collection("xstore_events").deleteMany({});
+  cycleGetEventChunks(xStore, "xstore_event_chunks");
+}, 3000);
+
+//
+
+const cycleGetEventChunks = async (contract, collectionName) => {
+  const _collectionName = collectionName.split("_")[0] + "_events";
+  console.log("cycleGetEventChunks", collectionName);
   const lastChunkArr = await dbClient
     .db("xdb")
-    .collection("xstore_event_chunks")
+    .collection(collectionName)
     .find()
     .project({ events: 0 })
     .sort({ startBlock: -1 })
     .limit(1)
     .toArray();
-
-  console.log("mostRecentChunk", lastChunkArr);
-
   let startBlock = null;
   if (lastChunkArr && lastChunkArr[0]) {
     const lastChunk = lastChunkArr[0];
-    const currentBlock = await web3.eth.getBlockNumber();
-    if (lastChunk.endBlock < currentBlock) {
-      startBlock = lastChunk.endBlock + 1;
+    if (!lastChunk.doneSavingEvents) {
+      console.log("deleting events...");
+      await dbClient
+        .db("xdb")
+        .collection(_collectionName)
+        .deleteMany({ blockNumber: { $gte: lastChunk.startBlock } });
+      console.log("deleting event chunk...");
+      await deleteFromCollection(collectionName, lastChunk);
     } else {
-      console.log(
-        "lastChunk.endBlock not < currentBlock",
-        lastChunk.endBlock,
-        currentBlock
-      );
+      const currentBlock = await web3.eth.getBlockNumber();
+      if (lastChunk.endBlock < currentBlock) {
+        startBlock = lastChunk.endBlock + 1;
+      }
     }
   } else if (Array.isArray(lastChunkArr) && lastChunkArr.length === 0) {
     startBlock = 11442000;
   }
-
   if (startBlock !== null) {
-    console.log("startBLock !== null", startBlock);
-
-    const newChunks = await fetchEventChunks(xStore, startBlock);
+    const newChunks = await fetchEventChunks(contract, startBlock);
     if (
       newChunks.length === 1 &&
       newChunks[0].events.length === 0 &&
       lastChunkArr[0]
     ) {
-      console.log(
-        "no new events, going to update",
-        lastChunkArr[0].endBlock,
-        "to",
-        newChunks[0].endBlock
-      );
-      await updateInCollection("xstore_event_chunks", lastChunkArr[0], {
+      await updateInCollection(collectionName, lastChunkArr[0], {
         endBlock: newChunks[0].endBlock,
       });
     } else if (newChunks.length > 0) {
-      console.log(
-        "newChunks.length =",
-        newChunks.length,
-        " newChunks[0].events.length:",
-        newChunks[0].events.length
-      );
       newChunks.sort((a, b) => a.startBlock - b.startBlock);
       for (let i = 0; i < newChunks.length; i++) {
-        console.log(
-          "adding obj to collection with startBlock:",
-          newChunks[i].startBlock,
-          " and endBlock:",
-          newChunks[i].endBlock
+        const newChunk = newChunks[i];
+        newChunk.doneSavingEvents = false;
+        const receipt = await addToCollection(collectionName, newChunk);
+        console.log(receipt.insertedId);
+        for (let j = 0; j < newChunk.events.length; j++) {
+          const event = newChunk.events[j];
+          await addToCollection(_collectionName, event);
+          console.log(`(${i}, ${j})`);
+        }
+        await updateInCollection(
+          collectionName,
+          { _id: receipt.insertedId },
+          { doneSavingEvents: true }
         );
-        await addToCollection("xstore_event_chunks", newChunks[i]);
       }
     }
-  } else {
-    console.log("startBlock = null");
   }
-
-  console.log("finished cycle");
   setTimeout(() => {
-    loopIndex += 1;
-    cycle();
+    cycleGetEventChunks(contract, collectionName);
   }, 3000);
 };
 
 const fetchEventChunks = async (contract, initialBlock) => {
-  console.log("inside fetch event chunks");
-  // const initialBlock = 11442000;
   const currentBlock = await web3.eth.getBlockNumber();
   let startBlock = initialBlock;
   let interval = 1024;
   let eventChunks = [];
   while (startBlock <= currentBlock) {
-    console.log("\ninside first while loop");
     interval *= 2;
-    console.log("doubling interval to", interval);
     let events;
     let endBlock;
     while (!events) {
@@ -158,38 +152,26 @@ const fetchEventChunks = async (contract, initialBlock) => {
         startBlock + interval > currentBlock
           ? currentBlock
           : startBlock + interval;
-
-      console.log("\ninside second while loop, interval = ", interval);
-      console.log("startBlock =", startBlock, " endBlock =", endBlock);
       try {
         events = await contract.getPastEvents("allEvents", {
           fromBlock: startBlock,
           toBlock: endBlock,
         });
-        console.log("got _events, length = ", events.length);
       } catch (error) {
         if (error.message.includes("response size exceeded")) {
           if (interval <= 1) {
-            throw "bottomed out inside cycle()";
+            throw "bottomed out";
           } else {
-            console.log(error.message);
             interval /= 2;
-            console.log("dividing interval in half to", interval);
           }
         } else {
           throw error;
         }
       }
     }
-    console.log("outside second while loop");
     eventChunks.push({ startBlock, endBlock, events });
     startBlock = endBlock + 1;
   }
-  console.log("outside first while loop");
 
   return eventChunks;
 };
-
-setTimeout(() => {
-  cycle();
-}, 3000);
