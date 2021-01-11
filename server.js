@@ -96,32 +96,64 @@ const cycleGetEventChunks = async (contract, collectionName) => {
       await deleteFromCollection(collectionName, lastChunk);
     } else {
       const currentBlock = await web3.eth.getBlockNumber();
-      if (lastChunk.endBlock < currentBlock) {
+      const safetyBuffer = 1;
+      if (lastChunk.endBlock < currentBlock - safetyBuffer) {
         startBlock = lastChunk.endBlock + 1;
+      } else {
+        startBlock = currentBlock - safetyBuffer - 1;
       }
     }
   } else if (Array.isArray(lastChunkArr) && lastChunkArr.length === 0) {
     startBlock = 11442000;
   }
   if (startBlock !== null) {
-    const newChunks = await fetchEventChunks(contract, startBlock);
+    const chunks = await fetchEventChunks(contract, startBlock);
     if (
-      newChunks.length === 1 &&
-      newChunks[0].events.length === 0 &&
+      chunks.length === 1 &&
+      chunks[0].events.length === 0 &&
       lastChunkArr[0]
     ) {
       await updateInCollection(collectionName, lastChunkArr[0], {
-        endBlock: newChunks[0].endBlock,
+        endBlock: chunks[0].endBlock,
       });
-    } else if (newChunks.length > 0) {
-      newChunks.sort((a, b) => a.startBlock - b.startBlock);
-      for (let i = 0; i < newChunks.length; i++) {
-        const newChunk = newChunks[i];
-        newChunk.doneSavingEvents = false;
-        const receipt = await addToCollection(collectionName, newChunk);
+    } else if (chunks.length > 0) {
+      const newChunks = [];
+      chunks.sort((a, b) => a.startBlock - b.startBlock);
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        if (
+          lastChunkArr.length > 0 &&
+          chunk.startBlock <= lastChunkArr[0].endBlock
+        ) {
+          const newEvents = [];
+          for (let _i; _i < chunk.events; _i++) {
+            const event = chunk.events[_i];
+            if (event.blockNumber <= lastChunkArr[0].endBlock) {
+              if (!lastChunkArr[0].events.find((e) => e.id === event.id)) {
+                console.log(
+                  "TODO--add to previous chunk document and also to events collection"
+                );
+              }
+            } else {
+              newEvents.push(event);
+            }
+          }
+          if (newEvents.length === 0) {
+            if (chunk.endBlock > lastChunkArr[0].endBlock) {
+              await updateInCollection(collectionName, lastChunkArr[0], {
+                endBlock: chunk.endBlock,
+              });
+            }
+            continue;
+          }
+          chunk.startBlock = lastChunkArr[0].endBlock + 1;
+          chunk.events = newEvents;
+        }
+        chunk.doneSavingEvents = false;
+        const receipt = await addToCollection(collectionName, chunk);
         console.log(receipt.insertedId);
-        for (let j = 0; j < newChunk.events.length; j++) {
-          const event = newChunk.events[j];
+        for (let j = 0; j < chunk.events.length; j++) {
+          const event = chunk.events[j];
           await addToCollection(_collectionName, event);
           console.log(`(${i}, ${j})`);
         }
@@ -169,6 +201,7 @@ const fetchEventChunks = async (contract, initialBlock) => {
         }
       }
     }
+    console.log("new chunk", startBlock, endBlock, events.length);
     eventChunks.push({ startBlock, endBlock, events });
     startBlock = endBlock + 1;
   }
