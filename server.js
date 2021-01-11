@@ -3,6 +3,8 @@ import express from "express";
 import Web3 from "web3";
 import bn from "bn.js";
 
+import dbClient from "./db/client";
+
 import NftxContract from "./contracts/NFTXv4.json";
 import XStoreContract from "./contracts/XStore.json";
 import Erc20Contract from "./contracts/ERC20.json";
@@ -10,7 +12,12 @@ import Erc20Contract from "./contracts/ERC20.json";
 import addresses from "./addresses/mainnet.json";
 
 import xcollection from "./routes/xcollection";
-import { addToXCollection, getXCollection, replaceInXCollection } from "./db";
+import {
+  addToCollection,
+  getCollection,
+  updateInCollection,
+  replaceInCollection,
+} from "./db";
 
 const app = express();
 
@@ -20,7 +27,7 @@ app.get("/", (_, res) => {
 });
 
 const web3 = new Web3(
-  "wss://eth-mainnet.ws.alchemyapi.io/v2/fL1uiXELcu8QeuLAxoCNmnbf_XuVlHBD"
+  "https://eth-mainnet.alchemyapi.io/v2/fL1uiXELcu8QeuLAxoCNmnbf_XuVlHBD"
 );
 
 const nftx = new web3.eth.Contract(NftxContract.abi, addresses.nftxProxy);
@@ -53,85 +60,136 @@ app.use("/xcollection", xcollection);
 
 app.listen(process.env.PORT || 5000);
 
-setInterval(async () => {}, 5000);
-
-// const cycle = async () => {
-//   console.log("cycling...");
-//   const collection = await getXCollection();
-//   if (collection && collection[0]) {
-//     const counter = parseInt(collection[0].counter);
-//     console.log("new counter = ", counter);
-//     replaceInXCollection(collection[0], { counter: counter + 1 });
-//   }
-//   setTimeout(() => {
-//     cycle();
-//   }, 5000);
-// };
-
-// const cycle = async () => {
-//   console.log("cycling...");
-//   const funds = [];
-//   const numFunds = await xStore.methods.vaultsLength().call();
-//   for (let i = 0; i < numFunds; i++) {
-//     const fund = { vaultId: i };
-//     fund.xTokenAddress = await xStore.methods.xTokenAddress(i).call();
-//     fund.isD2Vault = await xStore.methods.isD2Vault(i).call();
-//     if (fund.isD2Vault) {
-//       fund.d2AssetAddress = await.xStore.methods.d2AssetAddress(i).call();
-//     } else {
-//       fund.nftAddress = await xStore.methods.
-//     }
-//   }
-//   setTimeout(() => {
-//     cycle();
-//   }, 5000);
-// };
-
+//
+let loopIndex = 0;
 const cycle = async () => {
-  console.log("\ncycling...");
-  const initialBlock = 11442000;
+  console.log("\ncycling...", loopIndex);
+
+  const lastChunkArr = await dbClient
+    .db("xdb")
+    .collection("xstore_event_chunks")
+    .find()
+    .project({ events: 0 })
+    .sort({ startBlock: -1 })
+    .limit(1)
+    .toArray();
+
+  console.log("mostRecentChunk", lastChunkArr);
+
+  let startBlock = null;
+  if (lastChunkArr && lastChunkArr[0]) {
+    const lastChunk = lastChunkArr[0];
+    const currentBlock = await web3.eth.getBlockNumber();
+    if (lastChunk.endBlock < currentBlock) {
+      startBlock = lastChunk.endBlock + 1;
+    } else {
+      console.log(
+        "lastChunk.endBlock not < currentBlock",
+        lastChunk.endBlock,
+        currentBlock
+      );
+    }
+  } else if (Array.isArray(lastChunkArr) && lastChunkArr.length === 0) {
+    startBlock = 11442000;
+  }
+
+  if (startBlock !== null) {
+    console.log("startBLock !== null", startBlock);
+
+    const newChunks = await fetchEventChunks(xStore, startBlock);
+    if (
+      newChunks.length === 1 &&
+      newChunks[0].events.length === 0 &&
+      lastChunkArr[0]
+    ) {
+      console.log(
+        "no new events, going to update",
+        lastChunkArr[0].endBlock,
+        "to",
+        newChunks[0].endBlock
+      );
+      await updateInCollection("xstore_event_chunks", lastChunkArr[0], {
+        endBlock: newChunks[0].endBlock,
+      });
+    } else if (newChunks.length > 0) {
+      console.log(
+        "newChunks.length =",
+        newChunks.length,
+        " newChunks[0].events.length:",
+        newChunks[0].events.length
+      );
+      newChunks.sort((a, b) => a.startBlock - b.startBlock);
+      for (let i = 0; i < newChunks.length; i++) {
+        console.log(
+          "adding obj to collection with startBlock:",
+          newChunks[i].startBlock,
+          " and endBlock:",
+          newChunks[i].endBlock
+        );
+        await addToCollection("xstore_event_chunks", newChunks[i]);
+      }
+    }
+  } else {
+    console.log("startBlock = null");
+  }
+
+  console.log("finished cycle");
+  setTimeout(() => {
+    loopIndex += 1;
+    cycle();
+  }, 3000);
+};
+
+const fetchEventChunks = async (contract, initialBlock) => {
+  console.log("inside fetch event chunks");
+  // const initialBlock = 11442000;
   const currentBlock = await web3.eth.getBlockNumber();
   let startBlock = initialBlock;
-  let interval = 10240;
-  const events = [];
-  while (startBlock < currentBlock) {
+  let interval = 1024;
+  let eventChunks = [];
+  while (startBlock <= currentBlock) {
     console.log("\ninside first while loop");
-    if (interval < 10240) {
-      interval *= 2;
-      console.log("doubling interval to", interval);
-    }
-    let _events;
-    while (!_events) {
-      const endBlock = startBlock + interval;
-      console.log("\ninside second while loop");
+    interval *= 2;
+    console.log("doubling interval to", interval);
+    let events;
+    let endBlock;
+    while (!events) {
+      endBlock =
+        startBlock + interval > currentBlock
+          ? currentBlock
+          : startBlock + interval;
+
+      console.log("\ninside second while loop, interval = ", interval);
+      console.log("startBlock =", startBlock, " endBlock =", endBlock);
       try {
-        _events = await xStore.getPastEvents("allEvents", {
+        events = await contract.getPastEvents("allEvents", {
           fromBlock: startBlock,
           toBlock: endBlock,
         });
-        console.log("got _events, length = ", _events.length);
+        console.log("got _events, length = ", events.length);
       } catch (error) {
-        throw error;
-        if (interval <= 1) {
-          throw "bottomed out inside cycle()";
+        if (error.message.includes("response size exceeded")) {
+          if (interval <= 1) {
+            throw "bottomed out inside cycle()";
+          } else {
+            console.log(error.message);
+            interval /= 2;
+            console.log("dividing interval in half to", interval);
+          }
         } else {
-          console.log(error.message);
-          interval /= 2;
-          console.log("dividing interval in half to", interval);
+          throw error;
         }
       }
     }
     console.log("outside second while loop");
-    events = events.concat(_events);
+    eventChunks.push({ startBlock, endBlock, events });
     startBlock = endBlock + 1;
   }
   console.log("outside first while loop");
 
-  setTimeout(() => {
-    cycle();
-  }, 5000);
+  return eventChunks;
 };
 
 setTimeout(() => {
   cycle();
-}, 5000);
+}, 3000);
