@@ -8,6 +8,7 @@ import dbClient from "./db/client";
 import NftxContract from "./contracts/NFTXv4.json";
 import XStoreContract from "./contracts/XStore.json";
 import Erc20Contract from "./contracts/ERC20.json";
+import XStoreMultiCallContract from "./contracts/XStoreMultiCall.json";
 
 import addresses from "./addresses/mainnet.json";
 
@@ -38,6 +39,10 @@ const nftxToken = new web3.eth.Contract(
   Erc20Contract.abi,
   "0x87d73e916d7057945c9bcd8cdd94e42a6f47f776"
 );
+const xStoreMultiCall = new web3.eth.Contract(
+  XStoreMultiCallContract.abi,
+  addresses.xStoreMultiCall
+);
 
 app.get("/nftx-circulating-supply", async (_, res) => {
   const ignoreList = [
@@ -62,16 +67,133 @@ app.use("/xcollection", xcollection);
 
 app.listen(process.env.PORT || 5000);
 
+const pendingChecks = [];
+const cycleGetFundDataIsRunning = false;
+
+const addNewPendingCheck = (event) => {
+  if (event.returnValues.vaultId) {
+    const index = parseInt(event.returnValues.vaultId);
+    if (!pendingChecks[index]) {
+      pendingChecks[index] = Date.now();
+    }
+  }
+};
+
+const getOldestPendingCheck = () => {
+  if (pendingChecks.length === 0) {
+    return null;
+  }
+  const retVal = [];
+  pendingChecks.forEach((elem, i) => {
+    if (elem) {
+      retVal.push(i);
+    }
+  });
+  const { index } = retVal.reduce(
+    (acc, elem, i) => {
+      if (elem < acc.time) {
+        return { index: i, time: elem };
+      } else {
+        return acc;
+      }
+    },
+    { index: null, time: Date.now() * 2 }
+  );
+  return index;
+};
+
+const startCycle = () => {
+  setTimeout(async () => {
+    try {
+      // await dbClient.db("xdb").collection("xstore_event_chunks").deleteMany({});
+      // await dbClient.db("xdb").collection("xstore_events").deleteMany({});
+      await cycleGetEventChunks(xStore, "xstore_event_chunks");
+      console.log("Finished first xstore event cycle");
+      // await dbClient.db("xdb").collection("nftx_event_chunks").deleteMany({});
+      // await dbClient.db("xdb").collection("nftx_events").deleteMany({});
+      await cycleGetEventChunks(nftx, "nftx_event_chunks");
+      console.log("Finished first nftx event cycle");
+
+      // await dbClient.db("xdb").collection("funds").deleteMany({});
+      const numFunds = parseInt(await xStore.methods.vaultsLength().call());
+      if (numFunds > 0) {
+        cycleGetFundData(0);
+      }
+    } catch (err) {
+      console.log("top level error:", err.message);
+      startCycle();
+    }
+  }, 3000);
+};
+startCycle();
 //
 
-setTimeout(async () => {
-  // await dbClient.db("xdb").collection("xstore_event_chunks").deleteMany({});
-  // await dbClient.db("xdb").collection("xstore_events").deleteMany({});
-  cycleGetEventChunks(xStore, "xstore_event_chunks");
-}, 3000);
+const cycleGetFundData = async (_index) => {
+  console.log(
+    "TODO: parrallelize this for times of high volume —— but still end all tasks before returning"
+  );
+
+  console.log("cycleGetFundData", _index);
+  let index = _index;
+  const oldestPendingCheck = getOldestPendingCheck();
+  if (oldestPendingCheck !== null) {
+    index = oldestPendingCheck;
+    pendingChecks[index] = null;
+    console.log("cycleGetFundData new index", index);
+  }
+  const fundData = await fetchFundData(index);
+  const dbFundDataArr = await dbClient
+    .db("xdb")
+    .collection("funds")
+    .find({ vaultId: { $eq: index } })
+    .toArray();
+  if (dbFundDataArr.length > 1) {
+    dbFundDataArr.forEach((elem, i) => {
+      if (i > 0) {
+        deleteFromCollection("funds", elem);
+      }
+    });
+  }
+  if (dbFundDataArr.length === 0) {
+    await addToCollection("funds", fundData);
+    console.log("added fund " + fundData.vaultId + " data");
+  } else {
+    const dbFundData = dbFundDataArr[0];
+    const updatedFundData = {};
+    Object.keys(dbFundData).forEach((key) => {
+      if (key !== "_id" && dbFundData[key] !== fundData[key]) {
+        updatedFundData[key] = dbFundData[key];
+      }
+    });
+    if (Object.keys(updatedFundData).length > 0) {
+      await updateInCollection("funds", dbFundDataArr, updatedFundData);
+      console.log("updated fund " + fundData.vaultId + " data");
+    } else {
+      console.log("fund data already up-to-date");
+    }
+  }
+  if (index !== _index) {
+    if (getOldestPendingCheck() !== null) {
+      cycleGetFundData(_index);
+    } else {
+      setTimeout(() => {
+        cycleGetFundData(_index);
+      }, 1000);
+    }
+  } else {
+    const numFunds = parseInt(await xStore.methods.vaultsLength().call());
+    const newIndex = (index + 1) % numFunds;
+    if (getOldestPendingCheck() !== null) {
+      cycleGetFundData(newIndex);
+    } else {
+      setTimeout(() => {
+        cycleGetFundData(newIndex);
+      }, 1000);
+    }
+  }
+};
 
 //
-
 const cycleGetEventChunks = async (contract, collectionName) => {
   const _collectionName = collectionName.split("_")[0] + "_events";
   console.log("cycleGetEventChunks", collectionName);
@@ -87,20 +209,20 @@ const cycleGetEventChunks = async (contract, collectionName) => {
   if (lastChunkArr && lastChunkArr[0]) {
     const lastChunk = lastChunkArr[0];
     if (!lastChunk.doneSavingEvents) {
-      console.log("deleting events...");
+      console.log("deleting events...", collectionName);
       await dbClient
         .db("xdb")
         .collection(_collectionName)
         .deleteMany({ blockNumber: { $gte: lastChunk.startBlock } });
-      console.log("deleting event chunk...");
+      console.log("deleting event chunk...", collectionName);
       await deleteFromCollection(collectionName, lastChunk);
     } else {
       const currentBlock = await web3.eth.getBlockNumber();
-      const safetyBuffer = 1;
-      if (lastChunk.endBlock < currentBlock - safetyBuffer) {
+      const safetyBuffer = 2;
+      if (lastChunk.endBlock <= currentBlock - safetyBuffer) {
         startBlock = lastChunk.endBlock + 1;
       } else {
-        startBlock = currentBlock - safetyBuffer - 1;
+        startBlock = currentBlock - safetyBuffer;
       }
     }
   } else if (Array.isArray(lastChunkArr) && lastChunkArr.length === 0) {
@@ -117,45 +239,75 @@ const cycleGetEventChunks = async (contract, collectionName) => {
         endBlock: chunks[0].endBlock,
       });
     } else if (chunks.length > 0) {
-      const newChunks = [];
+      // const newChunks = [];
       chunks.sort((a, b) => a.startBlock - b.startBlock);
       for (let i = 0; i < chunks.length; i++) {
+        console.log("top of for-loop", collectionName);
         const chunk = chunks[i];
-        if (
-          lastChunkArr.length > 0 &&
-          chunk.startBlock <= lastChunkArr[0].endBlock
-        ) {
-          const newEvents = [];
+        if (lastChunkArr[0] && chunk.startBlock <= lastChunkArr[0].endBlock) {
+          const oldChunkEventsToAdd = [];
+          const newChunkEvents = [];
           for (let _i; _i < chunk.events; _i++) {
             const event = chunk.events[_i];
             if (event.blockNumber <= lastChunkArr[0].endBlock) {
               if (!lastChunkArr[0].events.find((e) => e.id === event.id)) {
-                console.log(
-                  "TODO--add to previous chunk document and also to events collection"
-                );
+                oldChunkEventsToAdd.push(event);
               }
             } else {
-              newEvents.push(event);
+              newChunkEvents.push(event);
             }
           }
-          if (newEvents.length === 0) {
+          if (oldChunkEventsToAdd.length > 0) {
+            await updateInCollection(collectionName, lastChunkArr[0], {
+              doneSavingEvents: false,
+              events: lastChunkArr[0].events.concat(oldChunkEventsToAdd),
+            });
+            for (let j = 0; j < oldChunkEventsToAdd.length; j++) {
+              const eventToAdd = oldChunkEventsToAdd[j];
+              await addToCollection(_collectionName, event);
+              addNewPendingCheck(eventToAdd);
+              console.log(
+                `added new event from prev chunk (${i}, ${j})`,
+                collectionName
+              );
+            }
+            await updateInCollection(collectionName, lastChunkArr[0], {
+              doneSavingEvents: true,
+            });
+          }
+          if (newChunkEvents.length === 0) {
+            console.log("eventsToKeep is empty", collectionName);
             if (chunk.endBlock > lastChunkArr[0].endBlock) {
               await updateInCollection(collectionName, lastChunkArr[0], {
                 endBlock: chunk.endBlock,
               });
+              console.log(
+                "updated lastChunk endBlock from",
+                lastChunkArr[0].endBlock,
+                " to",
+                chunk.endBlock
+              );
             }
+            console.log("going to 'continue' now...", collectionName);
             continue;
           }
           chunk.startBlock = lastChunkArr[0].endBlock + 1;
-          chunk.events = newEvents;
+          chunk.events = newChunkEvents;
         }
         chunk.doneSavingEvents = false;
         const receipt = await addToCollection(collectionName, chunk);
-        console.log(receipt.insertedId);
+        console.log(
+          "added chunk with startBlock",
+          chunk.startBlock,
+          " and endBlock",
+          chunk.endBlock,
+          collectionName
+        );
         for (let j = 0; j < chunk.events.length; j++) {
           const event = chunk.events[j];
           await addToCollection(_collectionName, event);
-          console.log(`(${i}, ${j})`);
+          addNewPendingCheck(event);
+          console.log(`added event (${i}, ${j})`, collectionName);
         }
         await updateInCollection(
           collectionName,
@@ -163,6 +315,7 @@ const cycleGetEventChunks = async (contract, collectionName) => {
           { doneSavingEvents: true }
         );
       }
+      console.log("outside of for-loop", collectionName);
     }
   }
   setTimeout(() => {
@@ -201,10 +354,42 @@ const fetchEventChunks = async (contract, initialBlock) => {
         }
       }
     }
-    console.log("new chunk", startBlock, endBlock, events.length);
+    console.log(
+      "new chunk",
+      startBlock,
+      endBlock,
+      events.length,
+      Object.keys(addresses).find((key) => addresses[key] === contract._address)
+    );
     eventChunks.push({ startBlock, endBlock, events });
     startBlock = endBlock + 1;
   }
 
   return eventChunks;
+};
+
+const fetchFundData = async (vaultId) => {
+  const data = { vaultId: vaultId };
+  const vaultDataA = await xStoreMultiCall.methods
+    .getVaultDataA(vaultId)
+    .call();
+  const vaultDataB = await xStoreMultiCall.methods
+    .getVaultDataB(vaultId)
+    .call();
+  data.xTokenAddress = vaultDataA.xTokenAddress;
+  data.nftAddress = vaultDataA.nftAddress;
+  data.manager = vaultDataA.manager;
+  data.isClosed = vaultDataA.isClosed;
+  data.isD2Vault = vaultDataA.isD2Vault;
+  data.d2AssetAddress = vaultDataA.d2AssetAddress;
+  data.allowMintRequests = vaultDataB.allowMintRequests;
+  data.flipEligOnRedeem = vaultDataB.flipEligOnRedeem;
+  data.negateEligibility = vaultDataB.negateEligibility;
+  data.isFinalized = vaultDataB.isFinalized;
+  const fundToken = new web3.eth.Contract(
+    Erc20Contract.abi,
+    vaultDataA.xTokenAddress
+  );
+  data.xTokenSupply = await fundToken.methods.totalSupply().call();
+  return data;
 };
