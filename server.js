@@ -13,6 +13,8 @@ import TokenMultiCallContract from "./contracts/TokenMultiCall.json";
 
 import addresses from "./addresses/mainnet.json";
 
+const zeroAddress = "0x0000000000000000000000000000000000000000";
+
 import xcollection from "./routes/xcollection";
 import {
   getCollection,
@@ -65,6 +67,15 @@ app.get("/nftx-circulating-supply", async (_, res) => {
   res.send(web3.utils.fromWei(supply));
 });
 
+app.get("/funds-data", async (_, res) => {
+  const dbFundDataArr = await dbClient
+    .db("xdb")
+    .collection("funds")
+    .find()
+    .toArray();
+  res.send(dbFundDataArr);
+});
+
 app.use(cors());
 app.use(express.json());
 
@@ -73,7 +84,6 @@ app.use("/xcollection", xcollection);
 app.listen(process.env.PORT || 5000);
 
 const pendingChecks = [];
-const cycleGetFundDataIsRunning = false;
 
 const addNewPendingCheck = (event) => {
   if (event.returnValues.vaultId) {
@@ -133,6 +143,7 @@ const startCycle = () => {
 startCycle();
 
 const getFundDataHelper = async (index) => {
+  console.log("getFundDataHelper", index);
   const fundData = await fetchFundData(index);
   const dbFundDataArr = await dbClient
     .db("xdb")
@@ -165,34 +176,72 @@ const getFundDataHelper = async (index) => {
     }
   }
 };
-//
 
 const getD1Holdings = async (index) => {
-  /* const dbFundDataArr = await dbClient
-    .db("xdb")
-    .collection("funds")
-    .find({ vaultId: { $eq: index } })
-    .toArray(); */
+  const holdings = {};
   const dbXStoreEvents = await dbClient
     .db("xdb")
-    .collection("funds")
+    .collection("xstore_events")
     .find({
-      $or: [
-        { event: { $eq: "HoldingsAdded" } },
-        { vaultId: { $eq: "HoldingsRemoved" } },
+      $and: [
+        {
+          $or: [
+            { event: { $eq: "HoldingsAdded" } },
+            { event: { $eq: "HoldingsRemoved" } },
+          ],
+        },
+        { vaultId: { $eq: index } },
       ],
     })
     .sort({ blockNumber: 1, logIndex: 1 })
     .toArray();
-  if (dbFundDataArr.length === 0) {
-    return;
+  for (let i = 0; i < dbXStoreEvents.length; i++) {
+    const event = dbXStoreEvents[i];
+    holdings[event.returnValues.id] = event.event.includes("Added");
   }
+  return Object.keys(holdings).filter((key) => holdings[key]);
+};
+
+const getD1Requests = async (index) => {
+  const requests = {};
+  const dbXStoreEvents = await dbClient
+    .db("xdb")
+    .collection("xstore_events")
+    .find({
+      $and: [{ event: { $eq: "RequesterSet" } }, { vaultId: { $eq: index } }],
+    })
+    .sort({ blockNumber: 1, logIndex: 1 })
+    .toArray();
+  for (let i = 0; i < dbXStoreEvents.length; i++) {
+    const event = dbXStoreEvents[i];
+    requests[event.returnValues.id] = event.returnValues.requester;
+  }
+  return Object.keys(requests).filter((key) => requests[key] != zeroAddress);
+};
+
+const getD1Eligibilities = async (index) => {
+  const eligibilities = {};
+  const dbXStoreEvents = await dbClient
+    .db("xdb")
+    .collection("xstore_events")
+    .find({
+      $and: [{ event: { $eq: "IsEligibleSet" } }, { vaultId: { $eq: index } }],
+    })
+    .sort({ blockNumber: 1, logIndex: 1 })
+    .toArray();
+  for (let i = 0; i < dbXStoreEvents.length; i++) {
+    const event = dbXStoreEvents[i];
+    eligibilities[event.returnValues.id] = event.returnValues._bool;
+  }
+  return Object.keys(eligibilities).filter((key) => eligibilities[key]);
 };
 
 const cycleGetFundData = async (index) => {
+  console.log("cycleGetFundData", index);
   let oldestPendingCheck = getOldestPendingCheck();
   if (oldestPendingCheck !== null) {
     while (oldestPendingCheck !== null) {
+      console.log("oldestPendingCheck", oldestPendingCheck);
       pendingChecks[index] = null;
       getFundDataHelper(oldestPendingCheck);
       oldestPendingCheck = getOldestPendingCheck();
@@ -280,6 +329,11 @@ const cycleGetEventChunks = async (contract, collectionName) => {
             });
             for (let j = 0; j < oldChunkEventsToAdd.length; j++) {
               const eventToAdd = oldChunkEventsToAdd[j];
+              if (eventToAdd.returnValues.vaultId) {
+                eventToAdd.vaultId = parseInt(eventToAdd.returnValues.vaultId);
+              } else {
+                eventToAdd.vaultId = null;
+              }
               await addToCollection(_collectionName, event);
               addNewPendingCheck(eventToAdd);
               console.log(
@@ -321,6 +375,11 @@ const cycleGetEventChunks = async (contract, collectionName) => {
         );
         for (let j = 0; j < chunk.events.length; j++) {
           const event = chunk.events[j];
+          if (event.returnValues.vaultId) {
+            event.vaultId = parseInt(event.returnValues.vaultId);
+          } else {
+            event.vaultId = null;
+          }
           await addToCollection(_collectionName, event);
           addNewPendingCheck(event);
           console.log(`added event (${i}, ${j})`, collectionName);
@@ -435,6 +494,9 @@ const fetchFundData = async (vaultId) => {
       name: erc20And721Data.erc721name,
       symbol: erc20And721Data.erc721symbol,
     };
+    data.holdings = await getD1Holdings(vaultId);
+    data.requests = await getD1Requests(vaultId);
+    data.eligibilities = await getD1Eligibilities(vaultId);
   }
 
   return data;
