@@ -9,6 +9,7 @@ import NftxContract from "./contracts/NFTXv4.json";
 import XStoreContract from "./contracts/XStore.json";
 import Erc20Contract from "./contracts/ERC20.json";
 import XStoreMultiCallContract from "./contracts/XStoreMultiCall.json";
+import TokenMultiCallContract from "./contracts/TokenMultiCall.json";
 
 import addresses from "./addresses/mainnet.json";
 
@@ -42,6 +43,10 @@ const nftxToken = new web3.eth.Contract(
 const xStoreMultiCall = new web3.eth.Contract(
   XStoreMultiCallContract.abi,
   addresses.xStoreMultiCall
+);
+const tokenMultiCall = new web3.eth.Contract(
+  TokenMultiCallContract.abi,
+  addresses.tokenMultiCall
 );
 
 app.get("/nftx-circulating-supply", async (_, res) => {
@@ -114,7 +119,7 @@ const startCycle = () => {
       await cycleGetEventChunks(nftx, "nftx_event_chunks");
       console.log("Finished first nftx event cycle");
 
-      // await dbClient.db("xdb").collection("funds").deleteMany({});
+      await dbClient.db("xdb").collection("funds").deleteMany({});
       const numFunds = parseInt(await xStore.methods.vaultsLength().call());
       if (numFunds > 0) {
         cycleGetFundData(0);
@@ -126,21 +131,8 @@ const startCycle = () => {
   }, 3000);
 };
 startCycle();
-//
 
-const cycleGetFundData = async (_index) => {
-  console.log(
-    "TODO: parrallelize this for times of high volume —— but still end all tasks before returning"
-  );
-
-  console.log("cycleGetFundData", _index);
-  let index = _index;
-  const oldestPendingCheck = getOldestPendingCheck();
-  if (oldestPendingCheck !== null) {
-    index = oldestPendingCheck;
-    pendingChecks[index] = null;
-    console.log("cycleGetFundData new index", index);
-  }
+const getFundDataHelper = async (index) => {
   const fundData = await fetchFundData(index);
   const dbFundDataArr = await dbClient
     .db("xdb")
@@ -172,25 +164,49 @@ const cycleGetFundData = async (_index) => {
       console.log("fund data already up-to-date");
     }
   }
-  if (index !== _index) {
-    if (getOldestPendingCheck() !== null) {
-      cycleGetFundData(_index);
-    } else {
-      setTimeout(() => {
-        cycleGetFundData(_index);
-      }, 1000);
-    }
-  } else {
-    const numFunds = parseInt(await xStore.methods.vaultsLength().call());
-    const newIndex = (index + 1) % numFunds;
-    if (getOldestPendingCheck() !== null) {
-      cycleGetFundData(newIndex);
-    } else {
-      setTimeout(() => {
-        cycleGetFundData(newIndex);
-      }, 1000);
-    }
+};
+//
+
+const getD1Holdings = async (index) => {
+  /* const dbFundDataArr = await dbClient
+    .db("xdb")
+    .collection("funds")
+    .find({ vaultId: { $eq: index } })
+    .toArray(); */
+  const dbXStoreEvents = await dbClient
+    .db("xdb")
+    .collection("funds")
+    .find({
+      $or: [
+        { event: { $eq: "HoldingsAdded" } },
+        { vaultId: { $eq: "HoldingsRemoved" } },
+      ],
+    })
+    .sort({ blockNumber: 1, logIndex: 1 })
+    .toArray();
+  if (dbFundDataArr.length === 0) {
+    return;
   }
+};
+
+const cycleGetFundData = async (index) => {
+  let oldestPendingCheck = getOldestPendingCheck();
+  if (oldestPendingCheck !== null) {
+    while (oldestPendingCheck !== null) {
+      pendingChecks[index] = null;
+      getFundDataHelper(oldestPendingCheck);
+      oldestPendingCheck = getOldestPendingCheck();
+    }
+    await new Promise((resolve) => setTimeout(() => resolve(), 1000));
+  }
+  //
+  await getFundDataHelper(index);
+  //
+  const numFunds = parseInt(await xStore.methods.vaultsLength().call());
+  const newIndex = (index + 1) % numFunds;
+  setTimeout(() => {
+    cycleGetFundData(newIndex);
+  }, 1000);
 };
 
 //
@@ -376,20 +392,50 @@ const fetchFundData = async (vaultId) => {
   const vaultDataB = await xStoreMultiCall.methods
     .getVaultDataB(vaultId)
     .call();
-  data.xTokenAddress = vaultDataA.xTokenAddress;
-  data.nftAddress = vaultDataA.nftAddress;
+  // data.xTokenAddress = vaultDataA.xTokenAddress;
+  // data.nftAddress = vaultDataA.nftAddress;
   data.manager = vaultDataA.manager;
   data.isClosed = vaultDataA.isClosed;
   data.isD2Vault = vaultDataA.isD2Vault;
-  data.d2AssetAddress = vaultDataA.d2AssetAddress;
-  data.allowMintRequests = vaultDataB.allowMintRequests;
-  data.flipEligOnRedeem = vaultDataB.flipEligOnRedeem;
-  data.negateEligibility = vaultDataB.negateEligibility;
+  // data.d2AssetAddress = vaultDataA.d2AssetAddress;
+
   data.isFinalized = vaultDataB.isFinalized;
-  const fundToken = new web3.eth.Contract(
-    Erc20Contract.abi,
-    vaultDataA.xTokenAddress
-  );
-  data.xTokenSupply = await fundToken.methods.totalSupply().call();
+
+  if (data.isD2Vault) {
+    const doubleErc20Data = await tokenMultiCall.methods
+      .getDoubleErc20Data(vaultDataA.xTokenAddress, vaultDataA.d2AssetAddress)
+      .call();
+    data.fundToken = {
+      address: vaultDataA.xTokenAddress,
+      name: doubleErc20Data.name1,
+      symbol: doubleErc20Data.symbol1,
+      totalSupply: doubleErc20Data.totalSupply1,
+    };
+    data.asset = {
+      address: vaultDataA.d2AssetAddress,
+      name: doubleErc20Data.name2,
+      symbol: doubleErc20Data.symbol2,
+      totalSupply: doubleErc20Data.totalSupply2,
+    };
+  } else {
+    data.allowMintRequests = vaultDataB.allowMintRequests;
+    data.flipEligOnRedeem = vaultDataB.flipEligOnRedeem;
+    data.negateEligibility = vaultDataB.negateEligibility;
+    const erc20And721Data = await tokenMultiCall.methods
+      .getErc20And721Data(vaultDataA.xTokenAddress, vaultDataA.nftAddress)
+      .call();
+    data.fundToken = {
+      address: vaultDataA.xTokenAddress,
+      name: erc20And721Data.erc20Name,
+      symbol: erc20And721Data.erc20Symbol,
+      totalSupply: erc20And721Data.erc20TotalSupply,
+    };
+    data.asset = {
+      address: vaultDataA.nftAddress,
+      name: erc20And721Data.erc721name,
+      symbol: erc20And721Data.erc721symbol,
+    };
+  }
+
   return data;
 };
