@@ -129,7 +129,6 @@ const startCycle = () => {
       await cycleGetEventChunks(nftx, "nftx_event_chunks");
       console.log("Finished first nftx event cycle");
 
-      await dbClient.db("xdb").collection("funds").deleteMany({});
       const numFunds = parseInt(await xStore.methods.vaultsLength().call());
       if (numFunds > 0) {
         cycleGetFundData(0);
