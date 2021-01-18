@@ -27,6 +27,9 @@ import e from "express";
 
 const app = express();
 
+app.use(cors());
+app.use(express.json());
+
 // testing
 app.get("/", (_, res) => {
   res.send("<h1>Hello from Express Server!</h1>");
@@ -76,10 +79,15 @@ app.get("/funds-data", async (_, res) => {
   res.send(dbFundDataArr);
 });
 
-app.use(cors());
-app.use(express.json());
+app.get("/events-count", async (_, res) => {
+  const [xStoreEventsCount, nftxEventsCount] = await Promise.all([
+    dbClient.db("xdb").collection("xstore_events").countDocuments(),
+    dbClient.db("xdb").collection("nftx_events").countDocuments(),
+  ]);
+  res.send((xStoreEventsCount + nftxEventsCount).toString());
+});
 
-app.use("/xcollection", xcollection);
+// app.use("/xcollection", xcollection);
 
 app.listen(process.env.PORT || 5000);
 
